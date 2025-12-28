@@ -153,11 +153,18 @@ func (b *backend) pathLoginUpdate(ctx context.Context, req *logical.Request, dat
 		requestMetadata,
 	}
 
-	// Authenticate the request with Identity
-	if b.authenticationClient == nil && b.createAuthClient() != nil {
-		return logical.RespondWithStatusCode(nil, req, http.StatusInternalServerError)
+	// Get or create authentication client atomically
+	// Using a local reference prevents race conditions with Invalidate()
+	authClient, err := b.getOrCreateAuthClient(ctx, req.Storage)
+	if err != nil {
+		b.Logger().Error("Failed to create authentication client", "error", err)
+		return logical.ErrorResponse(
+			"Failed to authenticate with OCI Identity service. "+
+				"Ensure Vault is configured with valid credentials. Error: %v", err,
+		), nil
 	}
-	authenticateClientResponse, err := b.authenticationClient.AuthenticateClient(ctx, authenticateClientRequest)
+
+	authenticateClientResponse, err := authClient.AuthenticateClient(ctx, authenticateClientRequest)
 	if err != nil {
 		return badRequestLogicalResponse(req, b.Logger(), err), nil
 	}
@@ -195,7 +202,7 @@ func (b *backend) pathLoginUpdate(ctx context.Context, req *logical.Request, dat
 		requestMetadata,
 	}
 
-	filterGroupMembershipResponse, err := b.authenticationClient.FilterGroupMembership(ctx, filterGroupMembershipRequest)
+	filterGroupMembershipResponse, err := authClient.FilterGroupMembership(ctx, filterGroupMembershipRequest)
 	if err != nil {
 		return badRequestLogicalResponse(req, b.Logger(), err), nil
 	}

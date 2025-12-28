@@ -4,9 +4,10 @@ package ociauth
 import (
 	"context"
 	"fmt"
+	"strings"
+
 	"github.com/hashicorp/vault/sdk/framework"
 	"github.com/hashicorp/vault/sdk/logical"
-	"strings"
 )
 
 // These constants store the configuration keys
@@ -26,6 +27,35 @@ func pathConfig(b *backend) *framework.Path {
 			HomeTenancyIdConfigName: {
 				Type:        framework.TypeString,
 				Description: "The tenancy id of the account.",
+			},
+			"auth_mode": {
+				Type:        framework.TypeString,
+				Description: "Authentication mode: 'instance' (default) or 'apikey'. Use 'instance' when Vault runs inside OCI, 'apikey' when running outside OCI.",
+				Default:     "instance",
+			},
+			"tenancy_ocid": {
+				Type:        framework.TypeString,
+				Description: "Tenancy OCID for API key authentication (required when auth_mode=apikey).",
+			},
+			"user_ocid": {
+				Type:        framework.TypeString,
+				Description: "User OCID for API key authentication (required when auth_mode=apikey).",
+			},
+			"fingerprint": {
+				Type:        framework.TypeString,
+				Description: "API key fingerprint (required when auth_mode=apikey).",
+			},
+			"private_key": {
+				Type:        framework.TypeString,
+				Description: "PEM-encoded private key content (required when auth_mode=apikey).",
+			},
+			"private_key_passphrase": {
+				Type:        framework.TypeString,
+				Description: "Passphrase for encrypted private key (optional).",
+			},
+			"region": {
+				Type:        framework.TypeString,
+				Description: "OCI region (e.g., us-phoenix-1, required when auth_mode=apikey).",
 			},
 		},
 
@@ -125,6 +155,19 @@ func (b *backend) pathConfigRead(ctx context.Context, req *logical.Request, data
 		HomeTenancyIdConfigName: configEntry.HomeTenancyId,
 	}
 
+	// Add auth_mode if set
+	if configEntry.AuthMode != "" {
+		responseData["auth_mode"] = configEntry.AuthMode
+	}
+
+	// Add API key fields if configured (redact sensitive data)
+	if configEntry.AuthMode == "apikey" {
+		responseData["tenancy_ocid"] = configEntry.TenancyOCID
+		responseData["user_ocid"] = configEntry.UserOCID
+		responseData["fingerprint"] = configEntry.Fingerprint
+		responseData["region"] = configEntry.Region
+	}
+
 	return &logical.Response{
 		Data: responseData,
 	}, nil
@@ -147,14 +190,57 @@ func (b *backend) pathConfigCreateUpdate(ctx context.Context, req *logical.Reque
 		return logical.ErrorResponse("The specified config does not exist"), nil
 	}
 
+	// Get auth_mode, defaulting to "instance" for backwards compatibility
+	authMode := data.Get("auth_mode").(string)
+	if authMode == "" {
+		authMode = "instance"
+	}
+
+	// Validate auth_mode
+	if authMode != "instance" && authMode != "apikey" {
+		return logical.ErrorResponse("auth_mode must be 'instance' or 'apikey'"), nil
+	}
+
 	configEntry = &OCIConfigEntry{
 		HomeTenancyId: homeTenancyId,
+		AuthMode:      authMode,
+	}
+
+	// If API key mode, validate and store credentials
+	if authMode == "apikey" {
+		tenancyOCID := data.Get("tenancy_ocid").(string)
+		userOCID := data.Get("user_ocid").(string)
+		fingerprint := data.Get("fingerprint").(string)
+		privateKey := data.Get("private_key").(string)
+		region := data.Get("region").(string)
+		privateKeyPassphrase := data.Get("private_key_passphrase").(string)
+
+		// Validate required fields
+		if tenancyOCID == "" || userOCID == "" || fingerprint == "" ||
+			privateKey == "" || region == "" {
+			return logical.ErrorResponse(
+				"API key authentication requires tenancy_ocid, user_ocid, fingerprint, private_key, and region",
+			), nil
+		}
+
+		// Validate private key format (should contain PEM markers)
+		if !strings.Contains(privateKey, "BEGIN") || !strings.Contains(privateKey, "PRIVATE KEY") {
+			return logical.ErrorResponse("private_key must be in PEM format"), nil
+		}
+
+		configEntry.TenancyOCID = tenancyOCID
+		configEntry.UserOCID = userOCID
+		configEntry.Fingerprint = fingerprint
+		configEntry.PrivateKey = privateKey
+		configEntry.PrivateKeyPassphrase = privateKeyPassphrase
+		configEntry.Region = region
 	}
 
 	if err := b.setOCIConfig(ctx, req.Storage, configEntry); err != nil {
 		return nil, err
 	}
 
+	b.InvalidateKey(ctx, "config")
 	var resp logical.Response
 
 	return &resp, nil
@@ -162,12 +248,28 @@ func (b *backend) pathConfigCreateUpdate(ctx context.Context, req *logical.Reque
 
 // Delete a Config
 func (b *backend) pathConfigDelete(ctx context.Context, req *logical.Request, data *framework.FieldData) (*logical.Response, error) {
-	return nil, req.Storage.Delete(ctx, "config")
+	if err := req.Storage.Delete(ctx, "config"); err != nil {
+		return nil, err
+	}
+
+	b.InvalidateKey(ctx, "config")
+	return nil, nil
 }
 
 // Struct to hold the information associated with an OCI config
 type OCIConfigEntry struct {
-	HomeTenancyId string `json:"home_tenancy_id" `
+	HomeTenancyId string `json:"home_tenancy_id"`
+
+	// Authentication mode: "instance" (default) or "apikey"
+	AuthMode string `json:"auth_mode,omitempty"`
+
+	// API Key fields (used when AuthMode = "apikey")
+	TenancyOCID          string `json:"tenancy_ocid,omitempty"`
+	UserOCID             string `json:"user_ocid,omitempty"`
+	Fingerprint          string `json:"fingerprint,omitempty"`
+	PrivateKey           string `json:"private_key,omitempty"`
+	PrivateKeyPassphrase string `json:"private_key_passphrase,omitempty"`
+	Region               string `json:"region,omitempty"`
 }
 
 const pathConfigSyn = `
